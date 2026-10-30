@@ -363,7 +363,7 @@ setup_config() {
     echo -e "${green}═══════════════════════════════════════${plain}"
     echo ""
 
-    local cur_domain cur_key cur_limit cur_listen cur_fetch_interval cur_extra_domains
+    local cur_domain cur_key cur_limit cur_listen cur_fetch_interval cur_extra_domains cur_x_rss
     if $is_update; then
         cur_domain=$(env_get THEFEED_DOMAIN)
         cur_key=$(env_get THEFEED_KEY)
@@ -371,7 +371,13 @@ setup_config() {
         cur_listen=$(env_get THEFEED_LISTEN)
         cur_fetch_interval=$(env_get THEFEED_FETCH_INTERVAL)
         cur_extra_domains=$(env_get THEFEED_EXTRA_DOMAINS)
+        # Carried over like every other setting. This one used to be written
+        # back hard-coded, so each update -- which is how the script is
+        # normally re-run -- silently threw away whatever list the operator
+        # had put there.
+        cur_x_rss=$(env_get THEFEED_X_RSS_INSTANCES)
     fi
+    local x_rss_instances="${cur_x_rss:-https://nitter.net,http://nitter.net}"
 
     local domain=""
     while true; do
@@ -439,6 +445,50 @@ setup_config() {
             if [[ -n "$chat_domains" ]]; then chat_domains="${chat_domains},${cdom}"; else chat_domains="$cdom"; fi
             echo -e "  ${green}Added ${cdom}${plain}"
         done
+    fi
+
+    # Telegram proxy: carries real MTProto to Telegram's own data centres over
+    # DNS, on its own dedicated sub-domain(s) — never on the feed or messenger
+    # domains. Stored in THEFEED_MTPROTO_DOMAINS; empty = proxy off.
+    local cur_mtp_domains=""
+    $is_update && cur_mtp_domains=$(env_get THEFEED_MTPROTO_DOMAINS)
+    local mtproto_domains="$cur_mtp_domains"
+    local do_collect_md=false
+    echo ""
+    if [[ -n "$cur_mtp_domains" ]]; then
+        echo -e "${yellow}Telegram proxy domains: ${cur_mtp_domains}${plain}"
+        read -rp "Change Telegram proxy domains? [y/N]: " change_md
+        [[ "$change_md" == "y" || "$change_md" == "Y" ]] && do_collect_md=true
+    else
+        echo -e "${yellow}The Telegram proxy lets clients reach Telegram itself through this"
+        echo -e "server when only domestic traffic works. It needs dedicated sub-domain(s)"
+        echo -e "and makes outbound TCP connections to Telegram's data centres.${plain}"
+        read -rp "Enable the Telegram proxy? [y/N]: " add_md
+        [[ "$add_md" == "y" || "$add_md" == "Y" ]] && do_collect_md=true
+    fi
+    if $do_collect_md; then
+        echo -e "${yellow}Enter each Telegram proxy sub-domain (must differ from the feed and messenger domains; empty line to finish):${plain}"
+        mtproto_domains=""
+        while true; do
+            read -rp "  Domain: " mdom
+            mdom="${mdom//[[:space:]]/}"
+            [[ -z "$mdom" ]] && break
+            if [[ "$mdom" == "$domain" ]]; then echo -e "  ${red}Must differ from the main feed domain${plain}"; continue; fi
+            if [[ ",${chat_domains}," == *",${mdom},"* ]]; then echo -e "  ${red}Already a messenger domain${plain}"; continue; fi
+            if [[ -n "$mtproto_domains" ]]; then mtproto_domains="${mtproto_domains},${mdom}"; else mtproto_domains="$mdom"; fi
+            echo -e "  ${green}Added ${mdom}${plain}"
+        done
+    fi
+
+    # Only asked when the proxy is on: a cap matters because each active tunnel
+    # holds a socket to Telegram plus its buffers.
+    local cur_mtp_max=""
+    $is_update && cur_mtp_max=$(env_get THEFEED_MTPROTO_MAX_TUNNELS)
+    local mtproto_max_tunnels="${cur_mtp_max:-0}"
+    if [[ -n "$mtproto_domains" ]]; then
+        read -rp "Max concurrent Telegram proxy users (0 = uncapped) [${cur_mtp_max:-0}]: " mtproto_max_tunnels
+        mtproto_max_tunnels="${mtproto_max_tunnels:-${cur_mtp_max:-0}}"
+        [[ "$mtproto_max_tunnels" =~ ^[0-9]+$ ]] || mtproto_max_tunnels=0
     fi
 
     local passkey=""
@@ -612,10 +662,12 @@ setup_config() {
 THEFEED_DOMAIN=${domain}
 THEFEED_EXTRA_DOMAINS=${extra_domains}
 THEFEED_CHAT_DOMAINS=${chat_domains}
+THEFEED_MTPROTO_DOMAINS=${mtproto_domains}
+THEFEED_MTPROTO_MAX_TUNNELS=${mtproto_max_tunnels}
 THEFEED_KEY=${passkey}
 THEFEED_ALLOW_MANAGE=${allow_manage}
 THEFEED_MSG_LIMIT=${msg_limit}
-THEFEED_X_RSS_INSTANCES=https://nitter.net,http://nitter.net
+THEFEED_X_RSS_INSTANCES=${x_rss_instances}
 TELEGRAM_API_ID=${api_id}
 TELEGRAM_API_HASH=${api_hash}
 TELEGRAM_PHONE=${phone}
@@ -689,10 +741,12 @@ ENVEOF
 THEFEED_DOMAIN=${domain}
 THEFEED_EXTRA_DOMAINS=${extra_domains}
 THEFEED_CHAT_DOMAINS=${chat_domains}
+THEFEED_MTPROTO_DOMAINS=${mtproto_domains}
+THEFEED_MTPROTO_MAX_TUNNELS=${mtproto_max_tunnels}
 THEFEED_KEY=${passkey}
 THEFEED_ALLOW_MANAGE=${allow_manage}
 THEFEED_MSG_LIMIT=${msg_limit}
-THEFEED_X_RSS_INSTANCES=https://nitter.net,http://nitter.net
+THEFEED_X_RSS_INSTANCES=${x_rss_instances}
 TELEGRAM_API_ID=${api_id}
 TELEGRAM_API_HASH=${api_hash}
 TELEGRAM_PHONE=${phone}

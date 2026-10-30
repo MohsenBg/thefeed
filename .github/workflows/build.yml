@@ -258,6 +258,7 @@ jobs:
           gomobile init
 
       - name: Build gomobile AAR
+        timeout-minutes: 15
         run: |
           export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}"
           VERSION="${{ github.ref_type == 'tag' && github.ref_name || '0.0.1' }}"
@@ -269,8 +270,7 @@ jobs:
           # this; explicit flag works on older NDKs too.
           LDFLAGS="-s -w -X github.com/sartoopjj/thefeed/internal/version.Version=${VERSION} -X github.com/sartoopjj/thefeed/internal/version.Commit=${COMMIT} -X github.com/sartoopjj/thefeed/internal/version.Date=${DATE} -extldflags=-Wl,-z,max-page-size=16384"
           mkdir -p android/app/libs
-          gomobile bind -target=android/arm,android/arm64,android/386,android/amd64 -androidapi 24 \
-            -ldflags="${LDFLAGS}" -o android/app/libs/mobile.aar ./mobile
+          bash scripts/gomobile-android-aar.sh android/app/libs/mobile.aar "${LDFLAGS}"
 
       - name: Decode signing keystore
         env:
@@ -303,7 +303,7 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           VERSION="${{ github.ref_type == 'tag' && github.ref_name || '0.0.1' }}"
-          if [ ! -x ./gradlew ]; then gradle wrapper --gradle-version 8.10.2; fi
+          if [ ! -x ./gradlew ]; then gradle wrapper --gradle-version 8.11.1; fi
           if [ -f app/keystore.jks ]; then BT=release; TASK=assembleRelease; else BT=debug; TASK=assembleDebug; fi
 
           # Pass 1 — per-ABI split APKs (arm, arm64, x86, x86_64).
@@ -357,12 +357,15 @@ jobs:
           go mod tidy
 
       - name: Build Mobile.xcframework
+        timeout-minutes: 8
         run: |
           VERSION="${{ github.ref_type == 'tag' && github.ref_name || '0.0.1' }}"
           COMMIT=$(git rev-parse --short HEAD)
           DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           LDFLAGS="-X github.com/sartoopjj/thefeed/internal/version.Version=${VERSION} -X github.com/sartoopjj/thefeed/internal/version.Commit=${COMMIT} -X github.com/sartoopjj/thefeed/internal/version.Date=${DATE}"
-          gomobile bind -iosversion=14.0 -target=ios,iossimulator -ldflags="${LDFLAGS}" -o ios/Mobile.xcframework ./mobile
+          # Device slice only: the archive is for a device, and every extra
+          # slice is another concurrent compile of gotd/td/tg.
+          gomobile bind -iosversion=15.0 -target=ios/arm64 -ldflags="${LDFLAGS}" -o ios/Mobile.xcframework ./mobile
 
       - name: Archive (unsigned)
         run: |
