@@ -49,7 +49,7 @@ func (s *Server) handleTelInfo(w http.ResponseWriter, r *http.Request) {
 	h.mu.Unlock()
 	cells := h.cells.Load()
 
-	apiID, apiHash := h.apiCredentials()
+	apiID, apiHash, isDefault := h.apiCredentials()
 	resp := map[string]any{
 		// Whether an account is signed in -- confirmed by Telegram, not guessed
 		// from a file that exists whenever gotd has minted any key at all.
@@ -62,12 +62,18 @@ func (s *Server) handleTelInfo(w http.ResponseWriter, r *http.Request) {
 		// Shared backend: the session lives on the machine running the client,
 		// so every browser pointed here shares the account.
 		"shared": s.sharedBackend,
-		// Echoed so a typo is visible and fixable; these identify the app, not
-		// the account.
-		"apiId":   apiID,
-		"apiHash": apiHash,
+		// The bundled pair is in use: the UI says it is shared and offers to
+		// replace it. Its values are never sent here.
+		"defaultCredentials": isDefault,
+		// Whether this build carries a default to go back to.
+		"defaultAvailable": telDefaultAvailable(),
 		// Background checking, so the menu can show its state.
 		"watch": h.telWatchEnabled(),
+	}
+	// The user's own pair is echoed so a typo is visible and fixable.
+	if !isDefault {
+		resp["apiId"] = apiID
+		resp["apiHash"] = apiHash
 	}
 	// connecting + cells let the UI show that a slow link is still moving
 	// rather than an unmoving spinner.
@@ -124,8 +130,14 @@ func (s *Server) handleTelConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Server string `json:"server"`
+		Lang   string `json:"lang"`
 	}
 	_ = s.telDecode(r, &req)
+	if req.Lang == "fa" || req.Lang == "en" {
+		h.mu.Lock()
+		h.lang = req.Lang
+		h.mu.Unlock()
+	}
 
 	cfg, nickname, ok := s.configForServerKey(chatServerKey(req.Server))
 	if !ok {
@@ -136,24 +148,32 @@ func (s *Server) handleTelConnect(w http.ResponseWriter, r *http.Request) {
 	// through beginOp, so it clears it itself.
 	h.setErr(nil)
 
+	want := chatServerKey(cfg.Domain)
 	h.mu.Lock()
-	if h.bridge != nil {
+	if h.bridge != nil && h.serverKey == want {
 		h.mu.Unlock()
 		writeJSON(w, map[string]any{"ok": true, "already": true})
 		return
 	}
-	if h.connecting {
+	if h.connecting && h.connectingKey == want {
 		h.mu.Unlock()
 		writeJSON(w, map[string]any{"ok": true, "connecting": true})
 		return
 	}
-	h.connecting = true
+	// Another config is up or on its way: picking this one is a switch.
+	stop := func() {}
+	if h.bridge != nil || h.connecting {
+		stop = h.detachLocked()
+	}
+	h.connecting, h.connectingKey = true, want
+	gen := h.connGen
 	// The only place the running total restarts: it counts what THIS
 	// connection has cost, which is what the UI reports "in total".
 	h.cells.Store(0)
 	h.lastErr, h.lastErrKey = "", ""
 	base := h.ctx
 	h.mu.Unlock()
+	stop()
 
 	// Runs in the background and answers now: the handshake outlives any
 	// browser timeout. The UI follows /api/tel/info.
@@ -162,16 +182,16 @@ func (s *Server) handleTelConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(base, telConnectTimeout)
 	h.mu.Lock()
-	h.connectCancel = cancel
+	if h.connGen == gen {
+		h.connectCancel = cancel
+	}
 	h.mu.Unlock()
 	go func() {
 		defer cancel()
-		err := h.connect(ctx, cfg, nickname)
-		h.mu.Lock()
-		h.connecting = false
-		h.connectCancel = nil
-		h.mu.Unlock()
-		h.setErr(err)
+		err := h.connect(ctx, cfg, nickname, gen)
+		if h.connectDone(gen) {
+			h.setErr(err)
+		}
 	}()
 	writeJSON(w, map[string]any{"ok": true, "connecting": true})
 }
@@ -190,17 +210,29 @@ func (s *Server) handleTelCredentials(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		APIID   int    `json:"apiId"`
 		APIHash string `json:"apiHash"`
+		// UseDefault drops the user's own pair and goes back to the bundled one.
+		UseDefault bool `json:"useDefault"`
 	}
 	if err := s.telDecode(r, &req); err != nil {
 		http.Error(w, "bad request", 400)
 		return
 	}
-	if req.APIID <= 0 || strings.TrimSpace(req.APIHash) == "" {
+	oldID, oldHash, wasDefault := h.apiCredentials()
+	if req.UseDefault {
+		if !telDefaultAvailable() {
+			http.Error(w, "this build has no default credentials", 400)
+			return
+		}
+		req.APIID, req.APIHash = 0, ""
+	} else if req.APIID <= 0 || strings.TrimSpace(req.APIHash) == "" {
 		http.Error(w, "api id and hash required", 400)
 		return
 	}
-	oldID, oldHash := h.apiCredentials()
-	changed := oldID != req.APIID || oldHash != strings.TrimSpace(req.APIHash)
+	// Whether the app identity the session was made under changes.
+	changed := !wasDefault
+	if !req.UseDefault {
+		changed = wasDefault || oldID != req.APIID || oldHash != strings.TrimSpace(req.APIHash)
+	}
 	if err := s.setTelAPICredentials(req.APIID, req.APIHash); err != nil {
 		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -483,6 +515,7 @@ func (s *Server) telLogout(w http.ResponseWriter, r *http.Request, h *telHub) {
 	// The account comes off this device first, before anything that can hang
 	// or fail. Deleting the key and the conversations is the part that matters
 	// and the part that cannot go wrong: it is a file on this machine.
+	h.endSessions()
 	wipeErr := h.wipeSession()
 
 	// Revoking the key at Telegram is worth doing and not worth waiting for:
@@ -505,6 +538,8 @@ func (s *Server) telLogout(w http.ResponseWriter, r *http.Request, h *telHub) {
 		lcancel()
 	}
 	h.disconnect()
+	// A call that was still running may have filled the cache meanwhile.
+	h.store().Forget()
 
 	// ok reports what the user asked for: is the account off this device?
 	// Whether Telegram heard about it is separate, and reported separately.
@@ -672,8 +707,12 @@ func (s *Server) handleTelHistory(w http.ResponseWriter, r *http.Request) {
 	// messages it already has at once instead of a blank pane for the half
 	// minute a page of history costs over DNS. The live fetch follows.
 	if q.Get("cacheOnly") == "1" {
-		if cached := h.store().Thread(telCacheKey(peer)); len(cached) > 0 {
-			writeJSON(w, map[string]any{"ok": true, "cached": true, "messages": cached})
+		key := telCacheKey(peer)
+		// Deleted ids go with it even when nothing is left, so the page drops
+		// its own copies of what Telegram deleted.
+		cached, deleted := h.store().Thread(key), h.store().Deleted(key)
+		if len(cached) > 0 || len(deleted) > 0 {
+			writeJSON(w, map[string]any{"ok": true, "cached": true, "messages": cached, "deleted": deleted})
 			return
 		}
 		writeJSON(w, map[string]any{"ok": false, "reason": "tel_err_no_cache"})
@@ -693,6 +732,13 @@ func (s *Server) handleTelHistory(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, map[string]any{"ok": false, "reason": "tel_err_not_connected"})
 		return
+	}
+	// A poll of an open conversation also asks Telegram what changed, which
+	// is the only way edits to messages already held arrive: history only
+	// returns ids above the cursor. Deferred before endOp so it runs after
+	// it -- the refresh stands aside while any op is in flight.
+	if telAtoi(q.Get("offsetId"), 0) == 0 && telAtoi(q.Get("minId"), 0) > 0 {
+		defer h.refreshDialogs()
 	}
 	h.beginOp()
 	defer h.endOp()
@@ -800,6 +846,12 @@ func (s *Server) handleTelDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", 400)
 		return
 	}
+	// Direct messages only leave the list: no call, so no link needed.
+	if req.Peer.Direct {
+		h.store().ForgetPeer([]string{telCacheKey(req.Peer)})
+		writeJSON(w, map[string]any{"ok": true})
+		return
+	}
 	if _, err := h.current(); err != nil {
 		writeJSON(w, map[string]any{"ok": false, "reason": "tel_err_not_connected"})
 		return
@@ -815,6 +867,8 @@ func (s *Server) handleTelDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.setErr(nil)
+	// Out of the cache too, or a reload brings the conversation back.
+	h.store().ForgetPeer([]string{telCacheKey(req.Peer)})
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -990,7 +1044,7 @@ func telFail(w http.ResponseWriter, h *telHub, err error) {
 	// A connection that is gone must not look like one failing call: drop it
 	// so the UI offers reconnecting instead of steps that can only fail.
 	h.dropDeadBridge(err)
-	writeJSON(w, map[string]any{"ok": false, "reason": telStatusKey(err), "error": err.Error()})
+	writeJSON(w, map[string]any{"ok": false, "reason": h.statusKey(err), "error": err.Error()})
 }
 
 // telStatusKey maps a bridge error to the UI's i18n key, mirroring how chat
@@ -1027,6 +1081,24 @@ func telStatusKey(err error) string {
 		return "tel_err_auth_restart"
 	case tgerr.Is(err, "SEND_CODE_UNAVAILABLE"):
 		return "tel_err_send_code_unavailable"
+	case tgerr.Is(err, "PREMIUM_ACCOUNT_REQUIRED"):
+		return "tel_err_ad_premium"
+	case tgerr.Is(err, "AD_EXPIRED"):
+		return "tel_err_ad_expired"
+	case tgerr.Is(err, "MESSAGE_EDIT_TIME_EXPIRED"):
+		return "tel_err_edit_expired"
+	case tgerr.Is(err, "MESSAGE_AUTHOR_REQUIRED"):
+		return "tel_err_edit_not_yours"
+	case tgerr.Is(err, "MESSAGE_DELETE_FORBIDDEN"):
+		return "tel_err_delete_forbidden"
+	case tgerr.Is(err, "ALLOW_PAYMENT_REQUIRED"):
+		return "tel_err_paid"
+	case tgerr.Is(err, "CHAT_FORWARDS_RESTRICTED"):
+		return "tel_err_forward_protected"
+	case tgerr.Is(err, "CHAT_WRITE_FORBIDDEN", "CHAT_SEND_PLAIN_FORBIDDEN", "USER_IS_BLOCKED", "YOU_BLOCKED_USER", "CHAT_ADMIN_REQUIRED"):
+		return "tel_err_cannot_write"
+	case errors.Is(err, tgbridge.ErrNoDirectMessages):
+		return "tel_err_no_direct"
 	// Last of the named causes: the call never got its answer back. Telegram
 	// may have carried it out anyway, so the user has to be told to look before
 	// asking again. Placed after every Telegram error name so a real refusal is
@@ -1039,6 +1111,8 @@ func telStatusKey(err error) string {
 		return "tel_err_not_offered"
 	case errors.Is(err, client.ErrMTProtoServerDisabled):
 		return "tel_err_server_disabled"
+	case errors.Is(err, client.ErrMTProtoBusy):
+		return "tel_err_server_full"
 	case errors.Is(err, client.ErrMTProtoNoServerKey):
 		return "tel_err_no_key"
 	case errors.Is(err, client.ErrMTProtoUnverified):

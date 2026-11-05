@@ -794,8 +794,20 @@ func (h *chatHub) probeBackoff(ps *perServerChat, now time.Time) (bool, string) 
 // markReachable records a confirmed-reachable probe/register: clears the
 // failure backoff and stamps the positive availability cache.
 func (h *chatHub) markReachable(ps *perServerChat) {
+	// The call that proved it reachable went through this server's ChatInfo,
+	// so its limits are already known. Without them the cached availability
+	// rows carry none until the next full probe, and the quota ring is missing.
+	var lim map[string]any
+	if ps.client != nil {
+		if info := ps.client.CachedInfo(); info != nil {
+			lim = chatLimitsMap(info.Limits)
+		}
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if lim != nil {
+		ps.lastLimits = lim
+	}
 	ps.backoffUntil = time.Time{}
 	ps.lastReason = ""
 	ps.lastOKAt = time.Now()
@@ -1334,6 +1346,9 @@ type chatServerResult struct {
 	// Checking means the sweep ran out of time before this server answered.
 	// No verdict, no penalty: the UI finishes it via /api/chat/probe.
 	Checking bool `json:"checking,omitempty"`
+	// Limits are this server's own: each server sets its own, so the UI must
+	// read them per server, never from one shared value.
+	Limits map[string]any `json:"limits,omitempty"`
 }
 
 // chatLimitsMap renders a server's advertised limits for the UI.
@@ -1415,6 +1430,7 @@ func (h *chatHub) probeOneServer(ctx context.Context, ps *perServerChat, enabled
 	h.mu.Lock()
 	ps.lastLimits = lim
 	h.mu.Unlock()
+	res.Limits = lim
 	return res, lim
 }
 
@@ -1468,10 +1484,10 @@ func (s *Server) handleChatAvailability(w http.ResponseWriter, r *http.Request) 
 		enabled := h.serverEnabled(ps.serverKey)
 		// Positive cache: skip the probe for a recently-reachable server (unless forced).
 		if !forced && h.cachedAvailable(ps, now) {
-			out[i] = chatServerResult{Key: ps.serverKey, Name: h.serverName(ps), Domain: ps.domain, Enabled: enabled, Available: true, Cached: true}
 			h.mu.Lock()
 			cachedLim := ps.lastLimits
 			h.mu.Unlock()
+			out[i] = chatServerResult{Key: ps.serverKey, Name: h.serverName(ps), Domain: ps.domain, Enabled: enabled, Available: true, Cached: true, Limits: cachedLim}
 			// `limits` is shared with the probe goroutines below — guard it with
 			// the SAME local mutex they use (not h.mu) to avoid a data race.
 			mu.Lock()
@@ -1636,14 +1652,16 @@ func (s *Server) handleChatProbeServer(w http.ResponseWriter, r *http.Request) {
 	enabled := h.serverEnabled(key)
 	now := time.Now()
 	if r.URL.Query().Get("retry") != "1" && h.cachedAvailable(ps, now) {
+		h.mu.Lock()
+		cachedLim := ps.lastLimits
+		h.mu.Unlock()
 		resp := map[string]any{"server": chatServerResult{
 			Key: key, Name: h.serverName(ps), Domain: ps.domain, Enabled: enabled, Available: true, Cached: true,
+			Limits: cachedLim,
 		}}
-		h.mu.Lock()
-		if ps.lastLimits != nil {
-			resp["limits"] = ps.lastLimits
+		if cachedLim != nil {
+			resp["limits"] = cachedLim
 		}
-		h.mu.Unlock()
 		writeJSON(w, resp)
 		return
 	}
@@ -2304,7 +2322,7 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 	h.mu.Unlock()
 
 	writeJSON(w, map[string]any{
-		"ok": true, "seq": res.Seq,
+		"ok": true, "seq": res.Seq, "server": serverKey,
 		"remaining": res.Remaining, "resetUnix": res.ResetUnix,
 	})
 }
@@ -2449,7 +2467,7 @@ func (s *Server) handleChatPeerStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.Unlock()
 	if rem, reset, known := chatc.Quota(); known {
-		out["quota"] = map[string]any{"remaining": rem, "resetUnix": reset}
+		out["quota"] = map[string]any{"remaining": rem, "resetUnix": reset, "server": ps.serverKey}
 	}
 	if rec, err := chatc.FetchPeerKey(ctx, peer); err == nil {
 		h.mu.Lock()

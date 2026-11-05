@@ -60,7 +60,24 @@ func (s SessionFile) StoreSession(_ context.Context, data []byte) error {
 		}
 		data = sealed
 	}
-	return os.WriteFile(s.Path, data, 0o600)
+	// A reader sees the old session or the new one, never a half-written
+	// file, and a crash cannot leave it empty.
+	tmp := s.Path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if err == nil {
+		_ = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.Path)
 }
 
 // LoggedIn reports whether a session exists on disk. It does not prove the
@@ -147,6 +164,9 @@ type Options struct {
 	// handshake is completely silent: gotd just retries behind a backoff and
 	// the caller sees an unexplained stall.
 	Log func(string)
+	// LangCode is the language Telegram writes its own texts in, such as an
+	// ad's button. Empty means English.
+	LangCode string
 }
 
 // NewClient builds a Telegram client whose every byte travels through the DNS
@@ -182,6 +202,10 @@ func NewClient(opts Options) (*telegram.Client, error) {
 		// suppresses, and so acks are not delayed by gotd's 15-second default
 		// when a round trip costs more than that.
 		AckInterval: ackInterval,
+	}
+	if opts.LangCode != "" {
+		tgOpts.Device.LangCode = opts.LangCode
+		tgOpts.Device.SystemLangCode = opts.LangCode
 	}
 	if opts.TestDCs {
 		tgOpts.DC = 2

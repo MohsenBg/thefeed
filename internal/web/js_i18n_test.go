@@ -260,3 +260,214 @@ func TestJSChatDeliveryTicks(t *testing.T) {
 	}
 	t.Logf("%s", out)
 }
+
+// Every chat server sets its own limits and counts its own sends, so the
+// numbers shown must be those of the server the conversation uses.
+func TestJSChatLimitsPerServer(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	out, err := exec.Command(node, "jstest/chat_limits.test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("chat limits failed:\n%s", out)
+	}
+	t.Logf("%s", out)
+}
+
+// Typing in a Telegram conversation must survive round trips starting and
+// ending around it.
+func TestJSTelComposerSurvivesRenders(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	out, err := exec.Command(node, "jstest/tel_composer.test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("tel composer failed:\n%s", out)
+	}
+	t.Logf("%s", out)
+}
+
+// Every message Telegram has must reach the conversation, whatever we sent in
+// between, and an edit must replace the text already on screen.
+func TestJSTelNoGapsAndEdits(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	out, err := exec.Command(node, "jstest/tel_gaps.test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("tel gaps failed:\n%s", out)
+	}
+	t.Logf("%s", out)
+}
+
+// Every Tel request must send its payload, not request options wrapped as one.
+func TestJSTelCallsSendTheirPayload(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	out, err := exec.Command(node, "jstest/tel_calls.test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("tel calls failed:\n%s", out)
+	}
+	t.Logf("%s", out)
+}
+
+// Telegram's ads must be shown, marked as ads, and never hold the link.
+func TestJSTelSponsoredMessages(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	out, err := exec.Command(node, "jstest/tel_ads.test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("tel ads failed:\n%s", out)
+	}
+	t.Logf("%s", out)
+}
+
+// Tapping a message must offer Reply, and the send must go out as an answer.
+func TestJSTelReply(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	out, err := exec.Command(node, "jstest/tel_reply.test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("tel reply failed:\n%s", out)
+	}
+	t.Logf("%s", out)
+}
+
+// Deleted and self-destructed messages must leave the open conversation.
+func TestJSTelDeletes(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	out, err := exec.Command(node, "jstest/tel_deletes.test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("tel deletes failed:\n%s", out)
+	}
+	t.Logf("%s", out)
+}
+
+// Online status and typing must be reported, cheaply.
+func TestJSTelPresence(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	out, err := exec.Command(node, "jstest/tel_presence.test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("tel presence failed:\n%s", out)
+	}
+	t.Logf("%s", out)
+}
+
+// Direct messages to a channel's admins: button, one call, nothing paid.
+func TestJSTelDirect(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	out, err := exec.Command(node, "jstest/tel_direct.test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("tel direct failed:\n%s", out)
+	}
+	t.Logf("%s", out)
+}
+
+// The ⋮ on every message: edit our own, delete where Telegram can.
+func TestJSTelMessageActions(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	out, err := exec.Command(node, "jstest/tel_msgactions.test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("tel message actions failed:\n%s", out)
+	}
+	t.Logf("%s", out)
+}
+
+// Searching the posts of the open Mirror channel.
+func TestJSMirrorSearch(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	out, err := exec.Command(node, "jstest/tm_search.test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("mirror search failed:\n%s", out)
+	}
+	t.Logf("%s", out)
+}
+
+// Forwarding: the ⋮ item, the picker and its options, the call, the header.
+func TestJSTelForward(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	out, err := exec.Command(node, "jstest/tel_forward.test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("forward failed:\n%s", out)
+	}
+	t.Logf("%s", out)
+}
+
+// Switching the Telegram config while one is live.
+func TestJSTelSwitch(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	out, err := exec.Command(node, "jstest/tel_switch.test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("switch failed:\n%s", out)
+	}
+	t.Logf("%s", out)
+}
+
+// The Telegram intro is remembered on the backend, across ports.
+func TestJSTelIntro(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	out, err := exec.Command(node, "jstest/tel_intro.test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("intro failed:\n%s", out)
+	}
+	t.Logf("%s", out)
+}
+
+// The sign-in picker: every calling code, no readable names, region remembered.
+func TestJSTelDial(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	out, err := exec.Command(node, "jstest/tel_dial.test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("tel dial failed:\n%s", out)
+	}
+	t.Logf("%s", out)
+}
+
+// A bot's URL button goes through the link sheet, never straight out.
+func TestJSTelButtons(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	out, err := exec.Command(node, "jstest/tel_buttons.test.mjs").CombinedOutput()
+	if err != nil {
+		t.Fatalf("tel buttons failed:\n%s", out)
+	}
+	t.Logf("%s", out)
+}

@@ -18,8 +18,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gotd/td/telegram"
 	"github.com/sartoopjj/thefeed/internal/client"
 	"github.com/sartoopjj/thefeed/internal/protocol"
+	"github.com/sartoopjj/thefeed/internal/telcreds"
 	"github.com/sartoopjj/thefeed/internal/tgbridge"
 )
 
@@ -66,18 +68,28 @@ const (
 	telPingTimeout = 4 * time.Minute
 )
 
-// Telegram app credentials: they identify the app, not the user. Empty until
-// whoever ships the build registers a pair at my.telegram.org; until then the
-// tab asks the user for their own.
-const (
-	defaultTelAPIID   = 0
-	defaultTelAPIHash = ""
-)
+// telDefaultBlob is the bundled Telegram app credentials, sealed (see
+// internal/telcreds). Set only by release builds, from CI secrets:
+//
+//	-X github.com/sartoopjj/thefeed/internal/web.telDefaultBlob=...
+//
+// Empty in every other build, which then asks the user for their own pair.
+var telDefaultBlob string
+
+func telDefaultAvailable() bool {
+	_, _, ok := telcreds.Open(telDefaultBlob)
+	return ok
+}
 
 // telHub owns the Telegram bridge for this backend.
 type telHub struct {
 	s   *Server
 	dir string
+
+	// signOuts counts sign-outs; a connection's session handle writes only
+	// while it is unchanged (guarded by sessMu).
+	sessMu   sync.Mutex
+	signOuts uint64
 
 	mu sync.Mutex
 	// ctx is the hub's lifetime context, set by reset (mirrors chatHub): a
@@ -102,6 +114,11 @@ type telHub struct {
 	// connecting marks a connect running in the background; the request
 	// returns at once, since the handshake outlives any sensible timeout.
 	connecting bool
+	// connectingKey is the config that connect is for.
+	connectingKey string
+	// connGen numbers connection attempts; disconnect moves it on, so an
+	// attempt it superseded can no longer install itself or clear flags.
+	connGen uint64
 	// connectCancel aborts a connect in flight, so the user can give up
 	// instead of watching a counter they cannot stop.
 	connectCancel context.CancelFunc
@@ -113,6 +130,12 @@ type telHub struct {
 	// same key as the session. Built once on first use.
 	cacheOnce sync.Once
 	cache     *telCache
+	// lang is the UI language the page connected with, declared to Telegram
+	// so its own texts come back in it. Kept for automatic reconnects.
+	lang string
+	// ads holds each channel's sponsored messages for telAdTTL.
+	adsMu sync.Mutex
+	ads   map[string]telAdEntry
 
 	// resyncedChannels remembers which unknown channels have already cost a
 	// dialog-list rebuild, so one can never cost two.
@@ -176,10 +199,44 @@ func (h *telHub) sessionFile() tgbridge.SessionFile {
 	tc, err := loadTelCrypto(h.dir)
 	if err != nil {
 		log.Printf("tel: at-rest key unavailable (%v) — session left as it is on disk", err)
+		refuse := func([]byte) ([]byte, error) { return nil, err }
+		f.Seal, f.Open = refuse, refuse
 		return f
 	}
 	f.Seal, f.Open = tc.seal, tc.open
 	return f
+}
+
+// bridgeSession is the session handle for a new connection. After the user
+// signs out it stops writing: the connection still holds the key in memory and
+// saves it again on every reconnect. It reports success, because a failed save
+// drops the connection, and that is what delivers the sign-out to Telegram.
+func (h *telHub) bridgeSession() telegram.SessionStorage {
+	h.sessMu.Lock()
+	defer h.sessMu.Unlock()
+	return &telSessionHandle{SessionFile: h.sessionFile(), h: h, gen: h.signOuts}
+}
+
+type telSessionHandle struct {
+	tgbridge.SessionFile
+	h   *telHub
+	gen uint64
+}
+
+func (t *telSessionHandle) StoreSession(ctx context.Context, data []byte) error {
+	t.h.sessMu.Lock()
+	defer t.h.sessMu.Unlock()
+	if t.h.signOuts != t.gen {
+		return nil
+	}
+	return t.SessionFile.StoreSession(ctx, data)
+}
+
+// endSessions stops every session handle handed out so far.
+func (h *telHub) endSessions() {
+	h.sessMu.Lock()
+	h.signOuts++
+	h.sessMu.Unlock()
 }
 
 // refreshDialogs brings the cached conversations up to date behind an answer
@@ -224,12 +281,16 @@ func (h *telHub) store() *telCache {
 }
 
 // apiCredentials returns the user's own app id/hash, or the bundled default.
-func (h *telHub) apiCredentials() (int, string) {
+// isDefault says which: the default must never be shown, logged or stored.
+func (h *telHub) apiCredentials() (id int, hash string, isDefault bool) {
 	pl, err := h.s.loadProfiles()
 	if err == nil && pl.TelAPIID > 0 && strings.TrimSpace(pl.TelAPIHash) != "" {
-		return pl.TelAPIID, strings.TrimSpace(pl.TelAPIHash)
+		return pl.TelAPIID, strings.TrimSpace(pl.TelAPIHash), false
 	}
-	return defaultTelAPIID, defaultTelAPIHash
+	if id, hash, ok := telcreds.Open(telDefaultBlob); ok {
+		return id, hash, true
+	}
+	return 0, "", false
 }
 
 // reset points the hub at a new lifetime context and drops any live bridge,
@@ -248,7 +309,7 @@ func (h *telHub) reset(ctx context.Context) {
 
 // connect brings up the tunnel and the Telegram client. It runs without the
 // hub lock, which would otherwise block every status call for minutes.
-func (h *telHub) connect(ctx context.Context, cfg Config, nickname string) error {
+func (h *telHub) connect(ctx context.Context, cfg Config, nickname string, gen uint64) error {
 	// The bridge outlives its request, so the fetcher hangs off the hub's
 	// lifetime context, not the request's.
 	h.mu.Lock()
@@ -261,6 +322,11 @@ func (h *telHub) connect(ctx context.Context, cfg Config, nickname string) error
 	// Cancelling this stops the attempt: gotd's client runs on runCtx, which
 	// the request's own context does not reach.
 	h.mu.Lock()
+	if h.connGen != gen {
+		h.mu.Unlock()
+		cancel()
+		return context.Canceled
+	}
 	h.connectCancel = cancel
 	h.mu.Unlock()
 
@@ -378,13 +444,17 @@ func (h *telHub) connect(ctx context.Context, cfg Config, nickname string) error
 	}
 
 	h.setPhase(telPhaseTelegram)
-	apiID, apiHash := h.apiCredentials()
+	apiID, apiHash, _ := h.apiCredentials()
+	h.mu.Lock()
+	langCode := h.lang
+	h.mu.Unlock()
 	b := tgbridge.NewBridge()
 	if err := b.Start(runCtx, tgbridge.Options{
+		LangCode:  langCode,
 		APIID:     apiID,
 		APIHash:   apiHash,
 		Dial:      dial,
-		Session:   h.sessionFile(),
+		Session:   h.bridgeSession(),
 		NoUpdates: true, // the tunnel is scarce: fetch explicitly
 		// Must match the relay: a production client against a test DC dies
 		// deep in the handshake with "wrong DC".
@@ -413,6 +483,11 @@ func (h *telHub) connect(ctx context.Context, cfg Config, nickname string) error
 		return fail(runCtx.Err())
 	}
 	h.mu.Lock()
+	if h.connGen != gen {
+		h.mu.Unlock()
+		b.Stop()
+		return fail(context.Canceled)
+	}
 	h.bridge = b
 	h.sessCancel = cancel
 	h.connectCancel = nil
@@ -608,63 +683,93 @@ func (h *telHub) callBridge(ctx context.Context, retry bool, fn func(*tgbridge.B
 		return err
 	}
 	err = fn(b)
-	if err == nil || !isDeadConnection(err) || !retry {
-		return err
+	if err == nil {
+		return nil
+	}
+	if !isDeadConnection(err) || !retry {
+		return &bridgeErr{b, err}
 	}
 
-	// Claim the connect flag, exactly as /api/tel/connect does. Without it
-	// the hub has no bridge AND is not "connecting" for the whole rebuild --
-	// the two conditions /api/tel/connect checks -- so a reconnect tapped in
-	// that window builds a second bridge, and the one that loses the
-	// assignment polls DNS for ever on the user's query budget.
+	// Claim the connect flag, exactly as /api/tel/connect does, in the same
+	// lock as the teardown: a config picked in between must not be undone.
 	h.mu.Lock()
 	cfg, nick := h.lastCfg, h.lastNick
-	busy := h.connecting
-	if !busy && cfg.Domain != "" {
-		h.connecting = true
-	}
-	h.mu.Unlock()
-	if cfg.Domain == "" {
-		return err // nothing to rebuild from
-	}
-	if busy {
-		// Someone is already building one; ours would race it. The caller
-		// gets the original failure and the next call finds the new bridge.
-		return err
-	}
-	defer func() {
-		h.mu.Lock()
-		h.connecting = false
+	// Someone is already building one, or this bridge was replaced: either way
+	// ours would race it. The caller gets the original failure and the next
+	// call finds the new bridge.
+	if h.connecting || cfg.Domain == "" || h.bridge != b {
 		h.mu.Unlock()
-	}()
-	h.disconnect()
-	if rerr := h.connect(ctx, cfg, nick); rerr != nil {
+		return &bridgeErr{b, err}
+	}
+	stop := h.detachLocked()
+	h.connecting, h.connectingKey = true, chatServerKey(cfg.Domain)
+	gen := h.connGen
+	h.mu.Unlock()
+	stop()
+	defer h.connectDone(gen)
+	if rerr := h.connect(ctx, cfg, nick, gen); rerr != nil {
 		return rerr
 	}
-	b, err2 := h.current()
+	b2, err2 := h.current()
 	if err2 != nil {
 		return err2
 	}
-	return fn(b)
+	if err := fn(b2); err != nil {
+		return &bridgeErr{b2, err}
+	}
+	return nil
 }
+
+// bridgeErr ties a failure to the bridge that produced it, so tearing down a
+// dead bridge never takes a newer one with it.
+type bridgeErr struct {
+	b   *tgbridge.Bridge
+	err error
+}
+
+func (e *bridgeErr) Error() string { return e.err.Error() }
+func (e *bridgeErr) Unwrap() error { return e.err }
 
 func (h *telHub) disconnect() {
 	h.mu.Lock()
-	b, cancel := h.bridge, h.sessCancel
-	// Abort a connect that is still running, too.
-	if h.connectCancel != nil {
-		h.connectCancel()
-		h.connectCancel = nil
-	}
-	h.bridge, h.sessCancel = nil, nil
-	h.serverKey = ""
+	stop := h.detachLocked()
 	h.mu.Unlock()
-	if b != nil {
-		b.Stop()
+	stop()
+}
+
+// detachLocked takes the live bridge and any connect in flight off the hub and
+// returns what stops them, to be run once the lock is released.
+func (h *telHub) detachLocked() func() {
+	b, cancel, connCancel := h.bridge, h.sessCancel, h.connectCancel
+	h.bridge, h.sessCancel, h.connectCancel = nil, nil, nil
+	h.serverKey = ""
+	// The attempt under way is over too; its own cleanup now stands down.
+	h.connecting, h.connectingKey = false, ""
+	h.connGen++
+	return func() {
+		// Abort a connect that is still running, too.
+		if connCancel != nil {
+			connCancel()
+		}
+		if b != nil {
+			b.Stop()
+		}
+		if cancel != nil {
+			cancel()
+		}
 	}
-	if cancel != nil {
-		cancel()
+}
+
+// connectDone ends attempt gen, unless a newer one has taken over. Reports
+// whether gen was still the current attempt.
+func (h *telHub) connectDone(gen uint64) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.connGen != gen {
+		return false
 	}
+	h.connecting, h.connectingKey, h.connectCancel = false, "", nil
+	return true
 }
 
 // beginOp starts a new user-visible operation.
@@ -696,7 +801,17 @@ func (h *telHub) dropDeadBridge(err error) {
 	if err == nil || !isDeadConnection(err) {
 		return
 	}
-	h.disconnect()
+	h.mu.Lock()
+	var be *bridgeErr
+	if errors.As(err, &be) && be.b != h.bridge {
+		// That bridge is already gone; the current one, or the connect under
+		// way, is not this failure's.
+		h.mu.Unlock()
+		return
+	}
+	stop := h.detachLocked()
+	h.mu.Unlock()
+	stop()
 }
 
 // isDeadConnection reports whether an error means the Telegram connection is
@@ -844,8 +959,21 @@ func (h *telHub) current() (*tgbridge.Bridge, error) {
 	return h.bridge, nil
 }
 
-func (h *telHub) setErr(err error) {
+// statusKey is telStatusKey, except that a rejected built-in key is said to be
+// the built-in one: the user typed nothing, so "edit them" would point at
+// empty fields.
+func (h *telHub) statusKey(err error) string {
 	key := telStatusKey(err)
+	if key == "tel_err_bad_credentials" {
+		if _, _, isDefault := h.apiCredentials(); isDefault {
+			return "tel_err_default_creds_rejected"
+		}
+	}
+	return key
+}
+
+func (h *telHub) setErr(err error) {
+	key := h.statusKey(err)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if err == nil {
@@ -864,6 +992,9 @@ func (h *telHub) wipeSession() error {
 	// The conversations belong to the account being signed out of. Leaving
 	// them would show one person's chats to whoever signs in next.
 	h.store().Forget()
+	h.adsMu.Lock()
+	h.ads = nil
+	h.adsMu.Unlock()
 	h.forgetResume()
 	h.rememberAuthorized(false)
 	err := os.Remove(h.sessionFile().Path)
@@ -873,8 +1004,12 @@ func (h *telHub) wipeSession() error {
 	return err
 }
 
+// telMaxBody bounds a request to the Telegram endpoints; the largest real one
+// is a message of 4096 characters.
+const telMaxBody = 1 << 20
+
 func (s *Server) telDecode(r *http.Request, dst any) error {
-	return json.NewDecoder(r.Body).Decode(dst)
+	return json.NewDecoder(io.LimitReader(r.Body, telMaxBody)).Decode(dst)
 }
 
 func telAtoi(s string, def int) int {
@@ -938,9 +1073,13 @@ func (s *Server) configForServerKey(key string) (Config, string, bool) {
 func (s *Server) setTelAPICredentials(id int, hash string) error {
 	s.profilesMu.Lock()
 	defer s.profilesMu.Unlock()
-	pl, err := s.loadProfiles()
+	// A fresh install has no profile list yet; that is not a reason to refuse.
+	pl, err := s.loadProfilesExisting()
 	if err != nil {
 		return err
+	}
+	if pl == nil {
+		pl = &ProfileList{}
 	}
 	pl.TelAPIID = id
 	pl.TelAPIHash = strings.TrimSpace(hash)
@@ -1104,6 +1243,7 @@ func (h *telHub) Sync(ctx context.Context) error {
 	// -- otherwise it rings once more on the very poll that learns it is muted.
 	h.store().ApplyMutes(ch.Mutes)
 	n := h.store().ApplyNew(ch.New)
+	h.store().ApplyDeletes(ch.Deleted)
 	h.store().ApplyReads(ch.Reads)
 	// Reads made on another device, which is the only way an unread badge here
 	// can come down without the user opening the chat here too.

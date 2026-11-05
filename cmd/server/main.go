@@ -64,6 +64,9 @@ func main() {
 	mtprotoBufferKB := flag.Int("mtproto-buffer-kb", 32, "MTProto: per-tunnel downstream buffer in KB (paid per concurrent tunnel)")
 	mtprotoDownKBMin := flag.Int("mtproto-down-kb-per-min", 512, "MTProto: per-tunnel downstream throttle in KB/minute (0 = uncapped)")
 	mtprotoDialSeconds := flag.Int("mtproto-dial-seconds", 15, "MTProto: timeout when connecting to a Telegram data centre")
+	mtprotoMaxSessions := flag.Int("mtproto-max-sessions", 100000, "MTProto: sessions kept at once; when full, the quietest makes room for a new one")
+	mtprotoReplyBudgetMB := flag.Int("mtproto-reply-budget-mb", 256, "MTProto: memory for replies kept for retries, all sessions together, in MB")
+	mtprotoReplySessionKB := flag.Int("mtproto-reply-session-kb", 256, "MTProto: memory for replies kept for one session's retries, in KB")
 	mtprotoTestDCs := flag.Bool("mtproto-test-dcs", false, "MTProto: dial Telegram's TEST data centres instead of production")
 	chatSyncSeconds := flag.Int("chat-sync-seconds", 1, "Chat: flush the message store to disk every N seconds (0 = fsync every message: max durability, lower throughput; N>0: higher throughput, a crash may lose ≤N seconds of received messages)")
 	ghEnabled := flag.Bool("github-relay-enabled", false, "Serve media via GitHub (fast relay)")
@@ -226,17 +229,12 @@ func main() {
 	if *key == "" {
 		*key = os.Getenv("THEFEED_KEY")
 	}
-	if !*allowManage && os.Getenv("THEFEED_ALLOW_MANAGE") == "1" {
-		*allowManage = true
-	}
 	// THEFEED_ALLOW_MANAGE=0 explicitly disables, even if flag was set
-	if os.Getenv("THEFEED_ALLOW_MANAGE") == "0" {
-		*allowManage = false
+	if v, ok := envBool("THEFEED_ALLOW_MANAGE"); ok {
+		*allowManage = v
 	}
-	if env := os.Getenv("THEFEED_DEBUG"); env == "1" {
-		*debug = true
-	} else if env == "0" {
-		*debug = false
+	if v, ok := envBool("THEFEED_DEBUG"); ok {
+		*debug = v
 	}
 	if *fetchIntervalMin == 10 {
 		if v := os.Getenv("THEFEED_FETCH_INTERVAL"); v != "" {
@@ -315,20 +313,19 @@ func main() {
 	chatIntEnv(mtprotoBufferKB, 32, "THEFEED_MTPROTO_BUFFER_KB")
 	chatIntEnv(mtprotoDownKBMin, 512, "THEFEED_MTPROTO_DOWN_KB_PER_MIN")
 	chatIntEnv(mtprotoDialSeconds, 15, "THEFEED_MTPROTO_DIAL_SECONDS")
+	chatIntEnv(mtprotoMaxSessions, 100000, "THEFEED_MTPROTO_MAX_SESSIONS")
+	chatIntEnv(mtprotoReplyBudgetMB, 256, "THEFEED_MTPROTO_REPLY_BUDGET_MB")
+	chatIntEnv(mtprotoReplySessionKB, 256, "THEFEED_MTPROTO_REPLY_SESSION_KB")
 	// THEFEED_MTPROTO_ENABLED=0 turns the tunnel off even with domains set.
-	if v := os.Getenv("THEFEED_MTPROTO_ENABLED"); v == "0" {
-		*mtprotoEnabled = false
-	} else if v == "1" {
-		*mtprotoEnabled = true
+	if v, ok := envBool("THEFEED_MTPROTO_ENABLED"); ok {
+		*mtprotoEnabled = v
 	}
-	if v := os.Getenv("THEFEED_MTPROTO_TEST_DCS"); v == "1" {
+	if v, ok := envBool("THEFEED_MTPROTO_TEST_DCS"); ok && v {
 		*mtprotoTestDCs = true
 	}
 	// THEFEED_CHAT_ENABLED=0 turns chat off even with domains configured.
-	if v := os.Getenv("THEFEED_CHAT_ENABLED"); v == "0" {
-		*chatEnabled = false
-	} else if v == "1" {
-		*chatEnabled = true
+	if v, ok := envBool("THEFEED_CHAT_ENABLED"); ok {
+		*chatEnabled = v
 	}
 	// Clamp chat limits that ride uint16 on the wire.
 	clamp16 := func(v *int) {
@@ -400,10 +397,8 @@ func main() {
 		}
 	}
 
-	if env := os.Getenv("THEFEED_DNS_MEDIA_ENABLED"); env == "0" {
-		*dnsMediaEnabled = false
-	} else if env == "1" {
-		*dnsMediaEnabled = true
+	if v, ok := envBool("THEFEED_DNS_MEDIA_ENABLED"); ok {
+		*dnsMediaEnabled = v
 	}
 	if env := os.Getenv("THEFEED_DNS_MEDIA_MAX_SIZE_KB"); env != "" {
 		if n, err := strconv.Atoi(env); err == nil {
@@ -418,7 +413,7 @@ func main() {
 	if env := os.Getenv("THEFEED_DNS_MEDIA_COMPRESSION"); env != "" {
 		*dnsMediaCompression = env
 	}
-	if !*ghEnabled && os.Getenv("THEFEED_GITHUB_RELAY_ENABLED") == "1" {
+	if v, ok := envBool("THEFEED_GITHUB_RELAY_ENABLED"); ok && v {
 		*ghEnabled = true
 	}
 	if *ghToken == "" {
@@ -449,43 +444,46 @@ func main() {
 	}
 
 	cfg := server.Config{
-		ListenAddr:          *listen,
-		Domain:              *domain,
-		ExtraDomains:        extraDomainList,
-		Passphrase:          *key,
-		DataDir:             *dataDir,
-		ChannelsFile:        *channelsFile,
-		PrivateChannelsFile: *privateChannelsFile,
-		XAccountsFile:       *xAccountsFile,
-		XRSSInstances:       *xRSSInstances,
-		MaxPadding:          *maxPadding,
-		MsgLimit:            *msgLimit,
-		NoTelegram:          *noTelegram,
-		AllowManage:         *allowManage,
-		Debug:               *debug,
-		DNSMediaEnabled:     *dnsMediaEnabled,
-		DNSMediaMaxSize:     int64(*dnsMediaMaxSizeKB) * 1024,
-		DNSMediaCacheTTL:    *dnsMediaCacheTTLMin,
-		DNSMediaCompression: *dnsMediaCompression,
-		FetchInterval:       time.Duration(*fetchIntervalMin) * time.Minute,
-		ChatDomains:         chatDomainList,
-		ChatEnabled:         *chatEnabled,
-		ChatSendPerHour:     *chatSendPerHour,
-		ChatInboxCap:        *chatInboxCap,
-		ChatPerPairCap:      *chatPerPairCap,
-		ChatMaxMsgBytes:     *chatMaxMsgBytes,
-		ChatTTLHours:        *chatTTLHours,
-		ChatAccountTTLDays:  *chatAccountTTLDays,
-		ChatMaxAccounts:     *chatMaxAccounts,
-		ChatSyncSeconds:     *chatSyncSeconds,
-		MTProtoDomains:      mtprotoDomainList,
-		MTProtoEnabled:      *mtprotoEnabled,
-		MTProtoMaxTunnels:   *mtprotoMaxTunnels,
-		MTProtoIdleTTL:      time.Duration(*mtprotoIdleMinutes) * time.Minute,
-		MTProtoBufferBytes:  *mtprotoBufferKB * 1024,
-		MTProtoDownKBPerMin: *mtprotoDownKBMin,
-		MTProtoDialTimeout:  time.Duration(*mtprotoDialSeconds) * time.Second,
-		MTProtoTestDCs:      *mtprotoTestDCs,
+		ListenAddr:               *listen,
+		Domain:                   *domain,
+		ExtraDomains:             extraDomainList,
+		Passphrase:               *key,
+		DataDir:                  *dataDir,
+		ChannelsFile:             *channelsFile,
+		PrivateChannelsFile:      *privateChannelsFile,
+		XAccountsFile:            *xAccountsFile,
+		XRSSInstances:            *xRSSInstances,
+		MaxPadding:               *maxPadding,
+		MsgLimit:                 *msgLimit,
+		NoTelegram:               *noTelegram,
+		AllowManage:              *allowManage,
+		Debug:                    *debug,
+		DNSMediaEnabled:          *dnsMediaEnabled,
+		DNSMediaMaxSize:          int64(*dnsMediaMaxSizeKB) * 1024,
+		DNSMediaCacheTTL:         *dnsMediaCacheTTLMin,
+		DNSMediaCompression:      *dnsMediaCompression,
+		FetchInterval:            time.Duration(*fetchIntervalMin) * time.Minute,
+		ChatDomains:              chatDomainList,
+		ChatEnabled:              *chatEnabled,
+		ChatSendPerHour:          *chatSendPerHour,
+		ChatInboxCap:             *chatInboxCap,
+		ChatPerPairCap:           *chatPerPairCap,
+		ChatMaxMsgBytes:          *chatMaxMsgBytes,
+		ChatTTLHours:             *chatTTLHours,
+		ChatAccountTTLDays:       *chatAccountTTLDays,
+		ChatMaxAccounts:          *chatMaxAccounts,
+		ChatSyncSeconds:          *chatSyncSeconds,
+		MTProtoDomains:           mtprotoDomainList,
+		MTProtoEnabled:           *mtprotoEnabled,
+		MTProtoMaxTunnels:        *mtprotoMaxTunnels,
+		MTProtoIdleTTL:           time.Duration(*mtprotoIdleMinutes) * time.Minute,
+		MTProtoBufferBytes:       *mtprotoBufferKB * 1024,
+		MTProtoMaxSessions:       *mtprotoMaxSessions,
+		MTProtoReplyBudget:       *mtprotoReplyBudgetMB << 20,
+		MTProtoReplySessionBytes: *mtprotoReplySessionKB << 10,
+		MTProtoDownKBPerMin:      *mtprotoDownKBMin,
+		MTProtoDialTimeout:       time.Duration(*mtprotoDialSeconds) * time.Second,
+		MTProtoTestDCs:           *mtprotoTestDCs,
 		GitHubRelay: server.GitHubRelayConfig{
 			Enabled:    *ghEnabled,
 			Token:      *ghToken,
