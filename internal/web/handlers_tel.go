@@ -90,6 +90,12 @@ type telHub struct {
 	// while it is unchanged (guarded by sessMu).
 	sessMu   sync.Mutex
 	signOuts uint64
+	// wipes counts cache wipes. A call that was on the tunnel across one
+	// carries the previous account's data and must not be written back.
+	wipes atomic.Uint64
+	// wantBlocked asks the refresh behind the current answer to re-read the
+	// blocklist: a person's chat was opened, or refreshed by hand.
+	wantBlocked atomic.Bool
 
 	mu sync.Mutex
 	// ctx is the hub's lifetime context, set by reset (mirrors chatHub): a
@@ -271,7 +277,21 @@ func (h *telHub) refreshDialogs() {
 		if err := h.Sync(ctx); err != nil {
 			return
 		}
+		// The blocklist is read rather than learnt from the update stream: a
+		// block made on another device does not arrive in a difference. Only
+		// when the user opens or refreshes a person's chat -- never on a timer.
+		if h.wantBlocked.Swap(false) {
+			_, _ = h.readBlocked(ctx)
+		}
 	})
+}
+
+// noteBlockedInterest asks for the blocklist behind the answer being given,
+// for a person's or bot's chat only.
+func (h *telHub) noteBlockedInterest(peer tgbridge.Peer) {
+	if peer.Kind == tgbridge.PeerUser || peer.Kind == tgbridge.PeerBot {
+		h.wantBlocked.Store(true)
+	}
 }
 
 // store returns the message cache, loading it the first time it is asked for.
@@ -677,7 +697,20 @@ func (h *telHub) withBridgeOnce(ctx context.Context, fn func(*tgbridge.Bridge) e
 	return h.callBridge(ctx, false, fn)
 }
 
+// errTelAccountGone is the answer of a call that outlived the account it was
+// made for.
+var errTelAccountGone = errors.New("tel: signed out during the call")
+
 func (h *telHub) callBridge(ctx context.Context, retry bool, fn func(*tgbridge.Bridge) error) error {
+	wipes := h.wipes.Load()
+	err := h.callBridgeOnce(ctx, retry, fn)
+	if err == nil && h.wipes.Load() != wipes {
+		return errTelAccountGone
+	}
+	return err
+}
+
+func (h *telHub) callBridgeOnce(ctx context.Context, retry bool, fn func(*tgbridge.Bridge) error) error {
 	b, err := h.current()
 	if err != nil {
 		return err
@@ -991,6 +1024,7 @@ func randomID() int64 { return rand.Int63() }
 func (h *telHub) wipeSession() error {
 	// The conversations belong to the account being signed out of. Leaving
 	// them would show one person's chats to whoever signs in next.
+	h.wipes.Add(1)
 	h.store().Forget()
 	h.adsMu.Lock()
 	h.ads = nil
@@ -1242,6 +1276,11 @@ func (h *telHub) Sync(ctx context.Context) error {
 	// themselves, so a channel silenced elsewhere must already be silent here
 	// -- otherwise it rings once more on the very poll that learns it is muted.
 	h.store().ApplyMutes(ch.Mutes)
+	// Blocked or unblocked on another device: the page is told at once, so
+	// an open chat gains or loses its blocked bar without a reload.
+	if h.store().ApplyBlocks(ch.Blocks) {
+		h.s.broadcast("event: update\ndata: \"tel-blocks\"\n\n")
+	}
 	n := h.store().ApplyNew(ch.New)
 	h.store().ApplyDeletes(ch.Deleted)
 	h.store().ApplyReads(ch.Reads)
@@ -1360,6 +1399,8 @@ func (h *telHub) resyncFromDialogs(ctx context.Context, st tgbridge.UpdateState)
 	// paid DNS queries for with "load more chats", and did so on any resync:
 	// a cursor gap, or a single post from a channel the cache had not seen.
 	h.store().MergeDialogs(page.Dialogs)
+	// A first page (twenty rows): every pin is on it.
+	h.store().SettlePins(page.Dialogs)
 	h.store().SetDialogTotal(page.TotalKnown)
 	// Deliberately NOT SetDialogsComplete: this fetches a short page on
 	// purpose, to re-establish the cursor. It says nothing about whether the
